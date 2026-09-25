@@ -19,7 +19,8 @@ def _write_bytes(ds: FileDataset) -> bytes:
 
 
 def _ct_like(sop_uid: str, series_uid: str, study_uid: str, patient_id: str,
-             patient_name: str, frame_uid: str, pixels: bytes | None = None) -> bytes:
+             patient_name: str, frame_uid: str, pixels: bytes | None = None,
+             issuer_of_patient_id: str = "") -> bytes:
     file_meta = FileMetaDataset()
     file_meta.MediaStorageSOPClassUID = CTImageStorage
     file_meta.MediaStorageSOPInstanceUID = sop_uid
@@ -32,6 +33,8 @@ def _ct_like(sop_uid: str, series_uid: str, study_uid: str, patient_id: str,
     ds.SeriesInstanceUID = series_uid
     ds.FrameOfReferenceUID = frame_uid
     ds.PatientID = patient_id
+    if issuer_of_patient_id:
+        ds.IssuerOfPatientID = issuer_of_patient_id
     ds.PatientName = patient_name
     ds.PatientBirthDate = "19800115"
     ds.PatientSex = "M"

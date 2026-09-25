@@ -5,7 +5,10 @@
 上传一个包含 DICOM 文件的 ZIP，服务会：
 
 1. 用**用户提供的稳定密钥**（stable secret）对患者身份做 HMAC-SHA256 派生，生成
-   **患者级稳定伪名**（同一患者跨批次伪名相同；换密钥则全部不同）；
+   **患者级稳定伪名**（同一患者跨批次伪名相同；换密钥则全部不同）。患者身份按
+   **`PatientID` + `IssuerOfPatientID`（签发机构）共同归组**：两个签发机构复用
+   同一患者号时视为不同患者，不会共用伪名与日期偏移（详见
+   [患者身份归组规则](#患者身份归组规则patientid--issuerofpatientid)）；
 2. 重写 `PatientID` / `PatientName` 等身份字段，清空/删除 DICOM PS3.15 Annex E
    Basic Application Confidentiality Profile 要求处理的机构、人员、自由文本标签及
    **全部私有标签**；
@@ -154,6 +157,35 @@ ZIP 中央目录允许出现**同名条目**（例如两个 `scan.dcm`，或 `./
 
 `../` 路径穿越、绝对路径与符号链接/设备等非常规条目仍然整体拒绝；解压总大小
 与条目数量上限不变（见[配置](#配置环境变量)）。
+
+### 患者身份归组规则（PatientID + IssuerOfPatientID）
+
+患者号本身**不跨签发机构唯一**：两家医院/两个系统完全可能给不同患者分配同一个
+`PatientID`。服务用以下**身份键（patient key）**判定“哪些文件属于同一患者”，
+伪名（匿名 `PatientID`/`PatientName`）与该患者的日期偏移都由身份键确定性派生，
+逐文件结果（`files[].patient_key`）、患者汇总（`patients[].key`）、检查汇总
+（`studies[].patient_key`）以及[跨任务一致性核对](#跨任务一致性核对post-jobsconsistency-check)
+全部使用同一个键：
+
+| 条件 | 身份键 | 说明 |
+| --- | --- | --- |
+| 非空 `PatientID` + 非空 `IssuerOfPatientID` | `issuer:<签发机构>\<患者号>` | 以**签发机构 + 患者号**共同确定身份；同号不同机构的两名患者得到不同伪名/日期偏移 |
+| 非空 `PatientID`，`IssuerOfPatientID` 缺失或为空 | `id:<患者号>` | 沿用旧规则，伪名与日期偏移与升级前**逐字节兼容** |
+| 无 `PatientID`、有 `PatientName` | `name:<NAME 大写>` | 按姓名归组 |
+| 无 `PatientID`/`PatientName`、有 `StudyInstanceUID` | `study:<Study UID>` | 按检查归组（`PATIENT_IDENTITY_FALLBACK` 警告） |
+| 以上均无 | `file:<文件 SHA 前16位>` | 按文件内容单独归组（`PATIENT_IDENTITY_FALLBACK` 警告） |
+
+要点：
+
+- **同一签发机构 + 同一患者号**在同一 ZIP、不同 ZIP 与不同批次之间仍稳定归为同一
+  患者，得到相同伪名与日期偏移；
+- **不同签发机构复用同一患者号**不再被误判为同一患者；因此跨任务一致性核对也不会
+  再把他们当成“同一 key”误判（同号不同机构表现为两条 `only_in_one_job` 覆盖差异，
+  而不是伪名冲突）；
+- 身份键用于派生与核对，**不会作为 PHI 写入匿名 DICOM**；原 `IssuerOfPatientID`
+  在匿名输出中被置空（`EMPTY`，见标签策略），不会保留签发机构信息；
+- 键中的分隔符 `\` 是 DICOM LO 字符集明令禁止的字符，因此机构号与患者号取任何
+  合法值都不会产生键歧义。
 
 ### 按匿名 StudyInstanceUID 下载检查子集
 
@@ -1087,9 +1119,12 @@ open("anonymized.zip", "wb").write(
 （`status=ready`），核对：
 
 1. **secret 指纹**：所有任务必须来自同一密钥（SHA-256 前 12 位），否则直接 `409`；
-2. **患者稳定伪名**：同一患者 key 的 `new_patient_id` / `new_patient_name` 是否一致、
+2. **患者稳定伪名**：同一患者 key（带签发机构时为 `issuer:<机构>\<患者号>`，
+   否则为 `id:<患者号>`，见[身份归组规则](#患者身份归组规则patientid--issuerofpatientid)）
+   的 `new_patient_id` / `new_patient_name` 是否一致、
    日期偏移是否一致（`shift_dates` 开关或平移区间不同会产生 `date_shift_mismatch`，
-   各任务使用的 `date_shift_min/max` 在 `jobs[]` 中回显便于核对）；
+   各任务使用的 `date_shift_min/max` 在 `jobs[]` 中回显便于核对）；同患者号但
+   签发机构不同的患者键不同，不会被误判为同一患者；
 3. **Study / Series / SOP 三级 UID 映射**：同一原始 UID 是否映射到同一新 UID，
    以及不同原始 UID 是否碰撞到同一新 UID。
 
@@ -1309,6 +1344,7 @@ else:
     {"key": "id:P-001", "new_patient_id": "MII3RH4JPCRSHQ4D",
      "new_patient_name": "ANON^MII3RH4JPC", "date_shift_days": -46,
      "file_count": 3}
+    // 带签发机构时 key 形如 "issuer:HOSP_A\\P-001"（机构 + 患者号共同归组）
   ],
   "studies":  [ /* old/new StudyInstanceUID 映射 */ ],
   "series":   [ /* old/new SeriesInstanceUID 映射 */ ],
@@ -1372,8 +1408,13 @@ else:
 
 **身份字段**
 
+- 患者按 `PatientID` + `IssuerOfPatientID`（签发机构）归组，无 `PatientID` 时按
+  姓名 / Study UID / 文件内容回退（规则见
+  [患者身份归组规则](#患者身份归组规则patientid--issuerofpatientid)）。
 - `PatientID`、`PatientName`：替换为患者级稳定伪名（Base32 编码的 HMAC 令牌 /
   `ANON^xxxxxx`）；嵌套序列中的患者标识同步替换。
+- `IssuerOfPatientID`：仅用于身份归组，匿名输出中**置空**，不保留签发机构信息；
+  `IssuerOfPatientIDQualifiersSequence` 等身份序列整段删除。
 - `PatientBirthDate`：开启日期平移时按该患者偏移平移，否则清空。
 - 其余所有人名（VR=`PN`）一律置空。
 - Annex E 列举的机构、站点、设备序列号、申请单号、自由文本/备注等标签：
@@ -1448,7 +1489,7 @@ else:
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
 │   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR/预览/几何/KVP/剂量事件/SEG 覆盖率错误模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何 / 系列 KVP 分布 / 剂量 SR 照射事件 / SEG 分割覆盖率 / ZIP 同名条目（308 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何 / 系列 KVP 分布 / 剂量 SR 照射事件 / SEG 分割覆盖率 / ZIP 同名条目 / 签发机构身份归组（314 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

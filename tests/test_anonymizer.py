@@ -292,6 +292,105 @@ def test_missing_identity_elements_get_pseudonym(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# 患者身份归组：IssuerOfPatientID + PatientID
+# --------------------------------------------------------------------------- #
+def _issuer_zip(tmp_path, members: dict[str, bytes]) -> tuple[str, list]:
+    """把字节字典写成 ZIP 并安全解压，返回 (解压目录, entries)。"""
+    zp = tmp_path / "issuer.zip"
+    with zipfile.ZipFile(zp, "w") as zf:
+        for name, blob in members.items():
+            zf.writestr(name, blob)
+    ex = tmp_path / "issuer-ex"
+    ex.mkdir()
+    entries = safe_extract_zip(str(zp), str(ex),
+                               settings.max_extracted_bytes,
+                               settings.max_extracted_files)
+    return str(ex), entries
+
+
+def _ct_with_issuer(sop: str, pid: str, issuer: str,
+                    study: str = "9.1", series: str = "9.2", frame: str = "9.3"):
+    return _ct_like(sop, series, study, pid, "Someone", frame,
+                    issuer_of_patient_id=issuer)
+
+
+def test_same_pid_different_issuers_are_distinct_patients(tmp_path):
+    """同患者号、不同签发机构：归为两名患者，伪名/日期偏移互不相同。"""
+    ex, entries = _issuer_zip(tmp_path, {
+        "hosp_a/a.dcm": _ct_with_issuer("9.0.1", "P-100", "HOSP_A"),
+        "hosp_b/b.dcm": _ct_with_issuer("9.0.2", "P-100", "HOSP_B",
+                                        study="8.1", series="8.2", frame="8.3"),
+    })
+    result = Anonymizer(secret=SECRET).run(ex, entries, str(tmp_path / "out"))
+
+    a = next(r for r in result.files if r.name == "hosp_a/a.dcm")
+    b = next(r for r in result.files if r.name == "hosp_b/b.dcm")
+    assert a.patient_key == r"issuer:HOSP_A\P-100"
+    assert b.patient_key == r"issuer:HOSP_B\P-100"
+    assert a.patient_key != b.patient_key
+    assert len(result.patients) == 2
+    pa = result.patients[a.patient_key]
+    pb = result.patients[b.patient_key]
+    assert pa.new_patient_id != pb.new_patient_id
+    assert pa.new_patient_name != pb.new_patient_name
+    assert pa.date_shift_days != pb.date_shift_days
+
+
+def test_same_issuer_and_pid_grouped_stably_across_runs(tmp_path):
+    """同签发机构 + 同患者号：批次内归为一组，跨批次伪名/偏移完全一致。"""
+    def run(tag):
+        sub = tmp_path / str(tag)
+        sub.mkdir()
+        ex, entries = _issuer_zip(sub, {
+            f"{tag}/a.dcm": _ct_with_issuer(f"9.0.{10 + tag}", "P-100", "HOSP_A"),
+            f"{tag}/b.dcm": _ct_with_issuer(f"9.0.{20 + tag}", "P-100", "HOSP_A",
+                                            study="9.1", series="9.2"),
+        })
+        return Anonymizer(secret=SECRET).run(
+            ex, entries, str(tmp_path / f"out-{tag}"))
+
+    r1, r2 = run(1), run(2)
+    key = r"issuer:HOSP_A\P-100"
+    assert set(r1.patients) == {key}
+    assert next(iter(r1.patients.values())).file_count == 2
+    assert r2.patients[key].new_patient_id == r1.patients[key].new_patient_id
+    assert r2.patients[key].new_patient_name == r1.patients[key].new_patient_name
+    assert r2.patients[key].date_shift_days == r1.patients[key].date_shift_days
+
+
+def test_empty_issuer_keeps_legacy_id_key_and_pseudonym(tmp_path):
+    """签发机构为空（缺标签或纯空白）：保留 id: 键，结果与旧版本兼容。"""
+    blob_a = _ct_with_issuer("9.0.1", "P-100", "")
+    blob_b = _ct_with_issuer("9.0.2", "P-100", "   ")
+    ex, entries = _issuer_zip(tmp_path, {
+        "a.dcm": blob_a, "b.dcm": blob_b,
+    })
+    result = Anonymizer(secret=SECRET).run(ex, entries, str(tmp_path / "out"))
+    assert {r.patient_key for r in result.files} == {"id:P-100"}
+    assert set(result.patients) == {"id:P-100"}
+    from app import crypto
+    p = result.patients["id:P-100"]
+    token, name = crypto.patient_pseudonyms(SECRET, "id:P-100")
+    assert (p.new_patient_id, p.new_patient_name) == (token, name)
+    assert p.date_shift_days == crypto.date_shift_days(SECRET, "id:P-100")
+
+
+def test_issuer_not_retained_in_anonymized_dicom(tmp_path):
+    """原 IssuerOfPatientID 不得留在匿名 DICOM 中（置空保留标签）。"""
+    ex, entries = _issuer_zip(tmp_path, {
+        "a.dcm": _ct_with_issuer("9.0.1", "P-100", "SECRET HOSPITAL"),
+    })
+    result = Anonymizer(secret=SECRET).run(ex, entries, str(tmp_path / "out"))
+    rep = result.files[0]
+    ds = pydicom.dcmread(os.path.join(result.output_dir, rep.output_name))
+    assert ds.IssuerOfPatientID == ""
+    # 变更预览记录为 EMPTY，旧值不进入输出
+    change = next(c for c in rep.changes if c.keyword == "IssuerOfPatientID")
+    assert change.action == "EMPTY"
+    assert change.new is None
+
+
+# --------------------------------------------------------------------------- #
 # ZIP 安全
 # --------------------------------------------------------------------------- #
 def test_zip_path_traversal_rejected(tmp_path):

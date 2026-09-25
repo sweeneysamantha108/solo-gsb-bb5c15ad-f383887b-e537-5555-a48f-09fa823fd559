@@ -302,9 +302,24 @@ class Anonymizer:
     # ----- 患者身份 -------------------------------------------------------- #
     @staticmethod
     def _patient_identity(ds: Dataset, file_path: str) -> tuple[str, Optional[str]]:
-        """返回 (identity, 诊断消息)。身份相同的文件归为同一患者。"""
+        """返回 (identity, 诊断消息)。身份相同的文件归为同一患者。
+
+        身份键规则：
+        * 非空 ``PatientID`` + 非空 ``IssuerOfPatientID``：以“签发机构 + 患者号”
+          共同确定身份（``issuer:<机构>\\<患者号>``）。患者号本身不跨机构唯一，
+          两个签发机构复用同一号码时不得共用伪名与日期偏移；
+        * 非空 ``PatientID`` 但签发机构为空：保持 ``id:<患者号>`` 键，伪名与
+          日期偏移结果与旧版本逐字节兼容；
+        * 无 PatientID 时依次按 PatientName / StudyInstanceUID / 文件内容回退。
+
+        键中使用 ``\\`` 分隔：LO 字符集不允许反斜杠，因此机构号与患者号如何
+        取值都不会产生键歧义或碰撞。
+        """
         pid = str(getattr(ds, "PatientID", "") or "").strip()
         if pid:
+            issuer = str(getattr(ds, "IssuerOfPatientID", "") or "").strip()
+            if issuer:
+                return f"issuer:{issuer}\\{pid}", None
             return f"id:{pid}", None
         name = str(getattr(ds, "PatientName", "") or "").strip()
         if name:

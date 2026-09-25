@@ -163,6 +163,63 @@ def test_same_secret_cross_batch_same_pseudonym(client, sample_zip_bytes):
     assert p1 == p2
 
 
+def _issuer_zip_bytes():
+    """两个签发机构复用同一患者号 P-100：必须归为两名患者。"""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("a.dcm", _ct_like(
+            "9.0.1", "9.2", "9.1", "P-100", "A^Patient", "9.3",
+            pixels=bytes(range(32)), issuer_of_patient_id="HOSP_A"))
+        zf.writestr("b.dcm", _ct_like(
+            "8.0.1", "8.2", "8.1", "P-100", "B^Patient", "8.3",
+            pixels=bytes(range(32)), issuer_of_patient_id="HOSP_B"))
+    return buf.getvalue()
+
+
+def test_patient_identity_scoped_by_issuer(client):
+    r = client.post(
+        "/jobs",
+        files={"file": ("issuers.zip", _issuer_zip_bytes(), "application/zip")},
+        data={"secret": "issuer-secret-12345"},
+    )
+    assert r.status_code == 201, r.text
+    job = r.json()
+    keys = {p["key"] for p in job["patients"]}
+    assert keys == {r"issuer:HOSP_A\P-100", r"issuer:HOSP_B\P-100"}
+    pseudonyms = [p["new_patient_id"] for p in job["patients"]]
+    assert pseudonyms[0] != pseudonyms[1]
+    # 逐文件结果携带同一身份键
+    for f in job["files"]:
+        assert f["patient_key"] in keys
+    # 原签发机构不留在匿名 DICOM 中
+    import pydicom
+    r2 = client.get(f"/jobs/{job['id']}/download")
+    with zipfile.ZipFile(io.BytesIO(r2.content)) as zf:
+        for name in zf.namelist():
+            ds = pydicom.dcmread(io.BytesIO(zf.read(name)))
+            assert ds.IssuerOfPatientID == ""
+
+
+def test_issuer_identity_consistent_across_batches(client):
+    def upload():
+        return client.post(
+            "/jobs",
+            files={"file": ("issuers.zip", _issuer_zip_bytes(), "application/zip")},
+            data={"secret": "issuer-cross-batch-123"},
+        ).json()
+
+    j1, j2 = upload(), upload()
+    body = client.post(
+        "/jobs/consistency-check", json={"job_ids": [j1["id"], j2["id"]]}
+    ).json()
+    # 同 (签发机构, 患者号) 跨批次匹配：无冲突、无“仅出现在部分任务”误判
+    assert body["overall_status"] == "consistent"
+    pm = body["patient_mappings"]
+    assert pm["checked_keys"] == 2
+    assert pm["conflict_count"] == 0
+    assert pm["only_in_one_job_count"] == 0
+
+
 def test_duplicate_member_names_processed_independently(client):
     """同一 ZIP 内两个同名条目（不同 SOP）：各自匿名化、各自写出。"""
     buf = io.BytesIO()
