@@ -44,7 +44,6 @@ EMPTY_KEYWORDS: frozenset[str] = frozenset(
         "SoftwareVersions",
         "ProtocolName",
         # 0010 患者
-        "IssuerOfPatientID",
         "PatientAge",
         "PatientBirthTime",
         "EthnicGroup",
@@ -81,6 +80,9 @@ REMOVE_KEYWORDS: frozenset[str] = frozenset(
         "OtherPatientNames",
         "PatientBirthName",
         "PatientMotherBirthName",
+        # 签发机构参与身份归组（issuer+PatientID），匿名结果中整标签删除，
+        # 不得保留原值；置空同样合规，删除可避免任何残留
+        "IssuerOfPatientID",
         "PatientAddress",
         "PatientTelephoneNumbers",
         "MedicalRecordLocator",

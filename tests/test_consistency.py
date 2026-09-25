@@ -130,6 +130,39 @@ def test_patient_only_in_one_job_is_coverage_not_conflict():
     assert diff.missing_in == ["j2"]
 
 
+def test_issuer_scoped_same_pid_not_merged_across_jobs():
+    """同患者号但不同签发机构是不同身份键，跨任务核对不得误判为同一患者。"""
+    scoped = PatientInfo(
+        key="id:HOSP-A\x1fP9", new_patient_id="SCOPEA000000001",
+        new_patient_name="ANON^SCOPEA0000", date_shift_days=10, file_count=1,
+    )
+    other = PatientInfo(
+        key="id:HOSP-B\x1fP9", new_patient_id="SCOPEB000000002",
+        new_patient_name="ANON^SCOPEB0000", date_shift_days=-7, file_count=1,
+    )
+    # 两个任务各自包含一名“患者号都是 P9”但签发机构不同的患者
+    j1 = _make_job("j1", patients={"id:HOSP-A\x1fP9": scoped})
+    j2 = _make_job("j2", patients={"id:HOSP-B\x1fP9": other})
+
+    out = _validated(consistency.build_report([j1, j2]))
+    assert out.overall_status == "consistent"  # 非同一键 -> 覆盖差异，不是冲突
+    assert out.patient_mappings.checked_keys == 0
+    assert out.patient_mappings.conflict_count == 0
+    keys = {d.patient_key for d in out.patient_mappings.differences}
+    assert keys == {"id:HOSP-A\x1fP9", "id:HOSP-B\x1fP9"}
+    assert all(
+        d.difference_type == "only_in_one_job"
+        for d in out.patient_mappings.differences
+    )
+
+    # 同签发机构 + 同患者号跨任务出现且结果一致 -> 正常核对通过
+    j3 = _make_job("j3", patients={"id:HOSP-A\x1fP9": scoped})
+    out2 = _validated(consistency.build_report([j1, j3]))
+    assert out2.overall_status == "consistent"
+    assert out2.patient_mappings.checked_keys == 1
+    assert out2.patient_mappings.conflict_count == 0
+
+
 def test_uid_conflict_detected_for_each_level():
     def jobs_with(level_entries):
         studies1 = studies2 = {}

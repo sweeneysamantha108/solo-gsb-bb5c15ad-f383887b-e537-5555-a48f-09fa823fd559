@@ -37,6 +37,11 @@ _VALUE_PREVIEW_LEN = 80
 
 _DT_RE = re.compile(r"^(\d{4})(\d{2})(\d{2})(.*)$", re.DOTALL)
 
+# 患者身份键中“签发机构 + 患者号”的分隔符。
+# 选用 ASCII 单元分隔符（US，0x1F）：DICOM LO 字段不允许该控制字符，
+# 因此签发机构与患者号的任意合法取值都不可能包含它，身份键无歧义。
+_IDENTITY_SEP = "\x1f"
+
 
 # --------------------------------------------------------------------------- #
 # 数据结构
@@ -302,9 +307,19 @@ class Anonymizer:
     # ----- 患者身份 -------------------------------------------------------- #
     @staticmethod
     def _patient_identity(ds: Dataset, file_path: str) -> tuple[str, Optional[str]]:
-        """返回 (identity, 诊断消息)。身份相同的文件归为同一患者。"""
+        """返回 (identity, 诊断消息)。身份相同的文件归为同一患者。
+
+        非空 PatientID 且带非空 IssuerOfPatientID 时，以
+        ``id:<签发机构><US><患者号>`` 共同确定身份键：不同签发机构复用同一
+        患者号不会被误并；同一签发机构 + 患者号在文件与批次间仍稳定归组。
+        签发机构为空（缺失/空白）时沿用 ``id:<患者号>``，伪名与日期偏移结果
+        与旧版本逐字节兼容。
+        """
         pid = str(getattr(ds, "PatientID", "") or "").strip()
         if pid:
+            issuer = str(getattr(ds, "IssuerOfPatientID", "") or "").strip()
+            if issuer:
+                return f"id:{issuer}{_IDENTITY_SEP}{pid}", None
             return f"id:{pid}", None
         name = str(getattr(ds, "PatientName", "") or "").strip()
         if name:

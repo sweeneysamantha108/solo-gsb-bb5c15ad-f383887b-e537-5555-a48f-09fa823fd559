@@ -292,6 +292,145 @@ def test_missing_identity_elements_get_pseudonym(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# 患者身份归组：IssuerOfPatientID + PatientID
+# --------------------------------------------------------------------------- #
+def _issuer_ct(sop_uid: str, pid: str, issuer: str | None) -> bytes:
+    return _ct_like(sop_uid, f"{sop_uid}.2", f"{sop_uid}.3", pid,
+                    "Doe^X", f"{sop_uid}.4", issuer=issuer)
+
+
+def test_patient_identity_key_uses_issuer_when_present():
+    from pydicom.dataset import Dataset
+
+    key = Anonymizer._patient_identity
+    ds = Dataset()
+    ds.PatientID = "P-9"
+    ds.IssuerOfPatientID = "HOSP-A"
+    assert key(ds, "/unused")[0] == "id:HOSP-A\x1fP-9"
+
+    ds = Dataset()
+    ds.PatientID = "P-9"
+    assert key(ds, "/unused")[0] == "id:P-9"  # 无签发机构：旧键不变
+
+    ds = Dataset()
+    ds.PatientID = "P-9"
+    ds.IssuerOfPatientID = "   "
+    assert key(ds, "/unused")[0] == "id:P-9"  # 空白签发机构等同缺失
+
+    ds = Dataset()
+    ds.PatientName = "Doe^John"
+    assert key(ds, "/unused")[0] == "name:DOE^JOHN"
+
+
+def test_same_pid_different_issuer_groups_separately(tmp_path):
+    """同 PatientID 在不同签发机构（含无签发机构）下是不同患者。"""
+    members_spec = [
+        ("a.dcm", _issuer_ct("9.1.1", "P-9", "HOSP-A")),
+        ("d.dcm", _issuer_ct("9.1.4", "P-9", "HOSP-A")),  # 同机构同号 -> 与 a 同组
+        ("b.dcm", _issuer_ct("9.1.2", "P-9", "HOSP-B")),
+        ("c.dcm", _issuer_ct("9.1.3", "P-9", None)),      # 无机构 -> 旧 id: 键
+    ]
+    zp = tmp_path / "iss.zip"
+    with zipfile.ZipFile(zp, "w") as zf:
+        for name, blob in members_spec:
+            zf.writestr(name, blob)
+    ex = tmp_path / "ex"
+    ex.mkdir()
+    members = safe_extract_zip(str(zp), str(ex),
+                               settings.max_extracted_bytes,
+                               settings.max_extracted_files)
+    result = Anonymizer(secret=SECRET).run(str(ex), members, str(tmp_path / "out"))
+
+    key_a, key_b, key_bare = "id:HOSP-A\x1fP-9", "id:HOSP-B\x1fP-9", "id:P-9"
+    assert set(result.patients) == {key_a, key_b, key_bare}
+    by_name = {r.name: r for r in result.files}
+    assert by_name["a.dcm"].patient_key == key_a
+    assert by_name["d.dcm"].patient_key == key_a
+    assert by_name["b.dcm"].patient_key == key_b
+    assert by_name["c.dcm"].patient_key == key_bare
+
+    pa, pb, pc = (result.patients[k] for k in (key_a, key_b, key_bare))
+    assert pa.file_count == 2  # 同机构同号两文件归为同一患者
+    assert pb.file_count == 1 and pc.file_count == 1
+    # 三个身份各自独立的伪名；同组两文件共用伪名
+    assert len({pa.new_patient_id, pb.new_patient_id, pc.new_patient_id}) == 3
+
+    # 每个输出文件的伪名与其身份键一致
+    for name, pinfo in (("a.dcm", pa), ("b.dcm", pb), ("c.dcm", pc), ("d.dcm", pa)):
+        ds = pydicom.dcmread(
+            os.path.join(result.output_dir, by_name[name].output_name))
+        assert ds.PatientID == pinfo.new_patient_id
+        assert str(ds.PatientName) == pinfo.new_patient_name
+        # 原签发机构不得留在匿名 DICOM 中
+        assert not hasattr(ds, "IssuerOfPatientID")
+
+    # 变更预览中 IssuerOfPatientID 记录为 REMOVE
+    issuer_changes = [
+        c for r in result.files for c in r.changes
+        if c.keyword == "IssuerOfPatientID"
+    ]
+    assert issuer_changes and all(c.action == "REMOVE" for c in issuer_changes)
+
+
+def test_issuer_identity_stable_across_batches(tmp_path):
+    """同一签发机构 + 患者号在两个独立批次中归为同一身份键、派生出相同结果。"""
+    def run_batch(tag: str):
+        zp = tmp_path / f"{tag}.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            zf.writestr("a.dcm", _issuer_ct("9.2.1", "P-9", "HOSP-A"))
+        ex = tmp_path / f"{tag}-ex"
+        ex.mkdir()
+        members = safe_extract_zip(str(zp), str(ex),
+                                   settings.max_extracted_bytes,
+                                   settings.max_extracted_files)
+        return Anonymizer(secret=SECRET).run(
+            str(ex), members, str(tmp_path / f"{tag}-out"))
+
+    r1, r2 = run_batch("b1"), run_batch("b2")
+    assert set(r1.patients) == set(r2.patients) == {"id:HOSP-A\x1fP-9"}
+    p1, p2 = r1.patients["id:HOSP-A\x1fP-9"], r2.patients["id:HOSP-A\x1fP-9"]
+    assert p1.new_patient_id == p2.new_patient_id
+    assert p1.new_patient_name == p2.new_patient_name
+    assert p1.date_shift_days == p2.date_shift_days
+
+
+def test_empty_issuer_keeps_legacy_identity_and_derivation(tmp_path):
+    """签发机构为空时保留旧 id: 键，伪名与日期偏移与升级前逐字节一致。"""
+    from app import crypto
+
+    zp = tmp_path / "bare.zip"
+    with zipfile.ZipFile(zp, "w") as zf:
+        zf.writestr("a.dcm", _issuer_ct("9.3.1", "P-001", None))
+    ex = tmp_path / "ex"
+    ex.mkdir()
+    members = safe_extract_zip(str(zp), str(ex),
+                               settings.max_extracted_bytes,
+                               settings.max_extracted_files)
+    result = Anonymizer(secret=SECRET, shift_dates=True).run(
+        str(ex), members, str(tmp_path / "out"))
+    assert set(result.patients) == {"id:P-001"}
+    pinfo = result.patients["id:P-001"]
+    legacy_id, legacy_name = crypto.patient_pseudonyms(SECRET, "id:P-001")
+    assert pinfo.new_patient_id == legacy_id
+    assert pinfo.new_patient_name == legacy_name
+    assert pinfo.date_shift_days == crypto.date_shift_days(SECRET, "id:P-001")
+
+    # 带签发机构的键不应与旧键派生出同一伪名
+    ex2 = tmp_path / "ex2"
+    ex2.mkdir()
+    zp2 = tmp_path / "scoped.zip"
+    with zipfile.ZipFile(zp2, "w") as zf:
+        zf.writestr("a.dcm", _issuer_ct("9.3.2", "P-001", "HOSP-A"))
+    members2 = safe_extract_zip(str(zp2), str(ex2),
+                                settings.max_extracted_bytes,
+                                settings.max_extracted_files)
+    r2 = Anonymizer(secret=SECRET).run(
+        str(ex2), members2, str(tmp_path / "out2"))
+    scoped = r2.patients["id:HOSP-A\x1fP-001"]
+    assert scoped.new_patient_id != legacy_id
+
+
+# --------------------------------------------------------------------------- #
 # ZIP 安全
 # --------------------------------------------------------------------------- #
 def test_zip_path_traversal_rejected(tmp_path):

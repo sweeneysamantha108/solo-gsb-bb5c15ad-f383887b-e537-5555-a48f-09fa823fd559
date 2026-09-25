@@ -5,7 +5,10 @@
 上传一个包含 DICOM 文件的 ZIP，服务会：
 
 1. 用**用户提供的稳定密钥**（stable secret）对患者身份做 HMAC-SHA256 派生，生成
-   **患者级稳定伪名**（同一患者跨批次伪名相同；换密钥则全部不同）；
+   **患者级稳定伪名**（同一患者跨批次伪名相同；换密钥则全部不同）。身份键优先由
+   `PatientID` 与其签发机构 `IssuerOfPatientID` 共同确定——不同机构复用同一患者号
+   不会被合并，签发机构为空时按患者号单独确定（详见
+   [患者身份归组规则](#患者身份归组规则patient_key)）；
 2. 重写 `PatientID` / `PatientName` 等身份字段，清空/删除 DICOM PS3.15 Annex E
    Basic Application Confidentiality Profile 要求处理的机构、人员、自由文本标签及
    **全部私有标签**；
@@ -132,6 +135,43 @@ curl http://localhost:8000/jobs/$JOB_ID/files
 # 3) 下载匿名化 ZIP（文件名为新 SOPInstanceUID，扁平结构）
 curl -OJ http://localhost:8000/jobs/$JOB_ID/download
 ```
+
+### 患者身份归组规则（`patient_key`）
+
+> API 默认地址：<http://localhost:8000>（Swagger 文档 <http://localhost:8000/docs>，
+> 健康检查 <http://localhost:8000/health>）。
+
+服务两遍扫描 ZIP 内全部文件，先为每个文件计算**患者身份键（`patient_key`）**：
+身份键相同的文件归为同一患者，共用患者级稳定伪名与日期偏移。身份键贯穿三处口径，
+保证互相对齐：
+
+- 逐文件结果 `files[].patient_key`；
+- 患者汇总 `patients[].key`（`POST http://localhost:8000/jobs` 与
+  `GET http://localhost:8000/jobs/{job_id}`）；
+- 跨任务一致性核对 `POST http://localhost:8000/jobs/consistency-check`。
+
+归组优先级如下：
+
+1. **非空 `PatientID` 且 `IssuerOfPatientID`（患者号签发机构，(0010,0021)）非空**：
+   以签发机构与患者号**共同**确定身份键，形如 `id:<签发机构>␟<患者号>`
+   （`␟` 为 ASCII 单元分隔符 `0x1F`；该字符不可能出现在合法 LO 字段中，因此
+   机构号与患者号的任意取值都不会产生歧义键）。两家签发机构在同一 ZIP 或不同批次中
+   **复用相同患者号时视为不同患者**，各自派生独立的伪名与日期偏移；而**同一签发机构 +
+   同一患者号**在文件之间、批次之间仍稳定归为同一患者，跨批次得到相同结果。
+2. **非空 `PatientID`、签发机构缺失或为空白**：身份键保持为 `id:<患者号>`，
+   与升级前完全一致——既有批次的伪名、日期偏移结果不变。
+3. **没有 `PatientID` 时逐级回退**：`name:<大写 PatientName>` →
+   `study:<StudyInstanceUID>` → `file:<文件内容哈希>`；后两者会给出
+   `PATIENT_IDENTITY_FALLBACK` 警告。
+
+原 `IssuerOfPatientID` **不会留在匿名 DICOM 中**（整标签 `REMOVE`；
+`IssuerOfPatientIDQualifiersSequence`、`OtherPatientIDs` /
+`OtherPatientIDsSequence` 等关联身份字段同样删除）。
+
+跨任务一致性核对按同一身份键对齐：`id:HOSP-A␟P-9` 与 `id:HOSP-B␟P-9`
+是**两个不同的键**——即使患者号相同，也不会被误判为同一患者；它们在批次间各自只出现
+一次时仅作为覆盖范围差异（`only_in_one_job`）列出，不产生伪名冲突。仅当
+签发机构与患者号都相同的键在不同任务派生出不同伪名时，才报告 `conflict`。
 
 ### ZIP 同名条目与重复实例
 
@@ -1089,7 +1129,10 @@ open("anonymized.zip", "wb").write(
 1. **secret 指纹**：所有任务必须来自同一密钥（SHA-256 前 12 位），否则直接 `409`；
 2. **患者稳定伪名**：同一患者 key 的 `new_patient_id` / `new_patient_name` 是否一致、
    日期偏移是否一致（`shift_dates` 开关或平移区间不同会产生 `date_shift_mismatch`，
-   各任务使用的 `date_shift_min/max` 在 `jobs[]` 中回显便于核对）；
+   各任务使用的 `date_shift_min/max` 在 `jobs[]` 中回显便于核对）。患者 key 按
+   [身份归组规则](#患者身份归组规则patient_key)计算：非空患者号带非空签发机构时为
+   `id:<签发机构>␟<患者号>`，因此同号不同机构的两名患者是两个不同的键，不会被
+   误判为同一患者，也不会因各自只在一个批次出现而报伪名冲突；
 3. **Study / Series / SOP 三级 UID 映射**：同一原始 UID 是否映射到同一新 UID，
    以及不同原始 UID 是否碰撞到同一新 UID。
 
@@ -1372,8 +1415,16 @@ else:
 
 **身份字段**
 
+- 患者按[身份归组规则](#患者身份归组规则patient_key)确定 `patient_key`：非空
+  `PatientID` 带非空 `IssuerOfPatientID` 时以签发机构 + 患者号共同确定身份
+  （`id:<签发机构>␟<患者号>`），不同机构复用同号不合并；签发机构为空时沿用
+  `id:<患者号>`，与旧版本结果兼容；无患者号时按 PatientName / StudyInstanceUID /
+  文件哈希逐级回退。
 - `PatientID`、`PatientName`：替换为患者级稳定伪名（Base32 编码的 HMAC 令牌 /
   `ANON^xxxxxx`）；嵌套序列中的患者标识同步替换。
+- `IssuerOfPatientID` 整标签删除（不保留原值），
+  `IssuerOfPatientIDQualifiersSequence`、`OtherPatientIDs(Sequence)` 等关联身份
+  字段一并删除。
 - `PatientBirthDate`：开启日期平移时按该患者偏移平移，否则清空。
 - 其余所有人名（VR=`PN`）一律置空。
 - Annex E 列举的机构、站点、设备序列号、申请单号、自由文本/备注等标签：

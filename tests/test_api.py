@@ -412,6 +412,64 @@ def test_consistency_check_overlapping_batches_reports_coverage(client, sample_z
     assert body["summary"]["uid_only_in_one_job"] > 0
 
 
+def test_consistency_check_issuer_scoped_identity_e2e(client):
+    """同患者号不同签发机构：批内分组、匿名输出 PHI 清除与跨任务核对均正确。"""
+    import pydicom
+
+    def zip_with(*spec):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            for name, sop, pid, issuer in spec:
+                zf.writestr(name, _ct_like(
+                    sop, sop + ".2", sop + ".3", pid, "Doe^X",
+                    sop + ".4", issuer=issuer))
+        return buf.getvalue()
+
+    secret = "issuer-scope-secret-123"
+    bytes_a = zip_with(
+        ("a.dcm", "9.9.1", "P-9", "HOSP-A"),
+        ("b.dcm", "9.9.2", "P-9", "HOSP-B"),
+    )
+    # 第二批：HOSP-A 的同一患者，外加一个无签发机构但同号的患者
+    bytes_b = zip_with(
+        ("c.dcm", "9.9.3", "P-9", "HOSP-A"),
+        ("d.dcm", "9.9.4", "P-9", None),
+    )
+    j1 = _upload(client, bytes_a, secret)
+    j2 = _upload(client, bytes_b, secret)
+    assert j1["status"] == "ready" and j2["status"] == "ready"
+
+    keys1 = {p["key"] for p in j1["patients"]}
+    assert keys1 == {"id:HOSP-A\x1fP-9", "id:HOSP-B\x1fP-9"}
+    assert len({p["new_patient_id"] for p in j1["patients"]}) == 2
+    assert {"id:HOSP-A\x1fP-9", "id:P-9"} <= {p["key"] for p in j2["patients"]}
+
+    # 匿名输出中不保留原签发机构
+    for job in (j1, j2):
+        zbytes = client.get(f"/jobs/{job['id']}/download").content
+        with zipfile.ZipFile(io.BytesIO(zbytes)) as zf:
+            for member in zf.namelist():
+                ds = pydicom.dcmread(io.BytesIO(zf.read(member)))
+                assert not hasattr(ds, "IssuerOfPatientID")
+                assert ds.PatientName != "Doe^X"
+
+    # 跨任务一致性核对：HOSP-A 患者两批共同出现且一致；其余是覆盖差异
+    r = client.post("/jobs/consistency-check",
+                    json={"job_ids": [j1["id"], j2["id"]]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["overall_status"] == "consistent"
+    pm = body["patient_mappings"]
+    assert pm["checked_keys"] == 1  # 仅 id:HOSP-A<US>P-9 在两批共同出现
+    assert pm["conflict_count"] == 0
+    # 同号不同机构不会被当成“同一患者”冲突或共同核对
+    assert pm["only_in_one_job_count"] >= 2
+    diff_keys = {d["patient_key"] for d in pm["differences"]}
+    assert "id:HOSP-B\x1fP-9" in diff_keys and "id:P-9" in diff_keys
+    assert all(d["difference_type"] == "only_in_one_job"
+               for d in pm["differences"])
+
+
 def test_consistency_check_different_secret_409(client, sample_zip_bytes):
     j1 = _upload(client, sample_zip_bytes, "consistency-secret-A")
     j2 = _upload(client, sample_zip_bytes, "consistency-secret-B")
